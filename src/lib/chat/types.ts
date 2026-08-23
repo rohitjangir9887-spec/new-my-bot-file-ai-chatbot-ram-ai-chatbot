@@ -23,6 +23,7 @@ export interface ToolCall {
 }
 
 export interface MessageMetadata {
+  messageId?: string;
   model?: string | null | undefined;
   status?: 'thinking' | 'streaming' | 'completed' | 'error' | null | undefined;
   usage?: { prompt_tokens: number; completion_tokens: number } | null | undefined;
