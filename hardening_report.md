@@ -1,43 +1,38 @@
-# Ramaibot Production Hardening - Final Report
+# Ramaibot Production Audit Status
 
-I have completed the production hardening pass for Ramaibot, focusing on security, privacy, and reliability.
+Updated: 2026-08-23
 
-## 1. Security Fixes
-- **Auth Enforcement**: Verified that `supabaseAdmin.auth.getUser(token)` is correctly used in `/api/chat/stream`.
-- **Ownership Verification**: Reinforced conversation ownership checks in the streaming API.
-- **Calculator Safety**: Added strict regex validation to the calculator tool to prevent potential code injection via mathematical expressions.
+## Fixed in source
 
-## 2. RLS Verification
-- **Conversations & Messages**: Confirmed that RLS policies correctly restrict access to the authenticated `user_id`.
-- **User Files**: Verified that storage and database records for files are strictly scoped to the owner.
+- Removed the Home UI implementation-prompt/debug injection source.
+- Moved provider calls to server-only adapters.
+- Added bounded provider fallback and plan-aware model selection.
+- Added real model inference health checks with short server-side caching.
+- Added safe calculator execution and bounded tool loops.
+- Added live Tavily search routing with an explicit unavailable state.
+- Added real image generation persistence and attachment handling.
+- Assistant messages are now persisted by the trusted server path rather than the browser.
+- Database message constraints reject empty/invalid messages.
+- Added owner-scoped message update/delete policies.
+- Added server-enforced Free/Pro/Ultra usage limits.
+- Added owner-scoped file/storage policies and file-count limits.
+- Added pgvector memory storage, embedding, similarity retrieval, and authenticated memory management.
+- Custom instructions are persisted to the authenticated profile and injected as system context.
+- Environment files are ignored and the previously committed `.env` file was removed.
+- Added CI for typecheck, lint, and production build.
 
-## 3. Reliability Fixes
-- **Retry Handling**: Added exponential backoff retry logic to conversation initialization in `store.ts`.
-- **Offline Mode**: Updated the persistence strategy to keep conversations available for read-only access while offline.
-- **Error Boundaries**: Reinforced component safety with React Suspense fallbacks for heavy modules.
+## Provider configuration required
 
-## 4. Performance Improvements
-- **Lazy Loading**: Verified that Settings, Voice, and Onboarding are correctly code-split.
-- **Asset Optimization**: Confirmed efficient rendering of Markdown and KaTeX without blocking the main thread.
+The application intentionally does not commit provider secrets. Configure these only in the deployment secret manager:
 
-## 5. Accessibility Improvements
-- **ARIA Labels**: Added missing `aria-label` and `title` attributes to the message composer, settings buttons, and sidebar controls.
-- **Interactive States**: Verified `aria-pressed` states for AI mode selectors and sidebar toggles.
+- `OPENAI_API_KEY` — GPT models and memory embeddings.
+- `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL_ID` — Claude.
+- `NVIDIA_API_KEY` + `NVIDIA_MODEL_ID` — NVIDIA NIM.
+- `TAVILY_API_KEY` — live Web Search.
+- `LOVABLE_AI_API_KEY` + optional `LOVABLE_IMAGE_MODEL` — image generation.
 
-## 6. Mobile QA Results
-- **Viewport Support**: Tested across 320px–430px; confirmed zero horizontal overflow.
-- **Input Safety**: Verified that the floating composer remains visible and accessible during mobile keyboard interaction.
+## Verification limitation
 
-## 7. Build Results
-- **TypeScript**: 0 errors.
-- **Build**: Successfully generated production-ready assets (2.92s).
+Repository source and CI configuration can be audited here, but production deployment credentials and an authenticated production URL are not available through the repository connector. Therefore provider runtime tests and a deployed mobile/desktop smoke test must be confirmed by the deployment CI/runtime before declaring production-ready.
 
-## 8. Configuration
-- **Environment**: Requires `LOVABLE_AI_API_KEY` for streaming and tool support.
-- **Storage**: Requires a `user-files` bucket in Supabase for attachments.
-
-## 9. Remaining Limitations
-- **Web Search**: Requires an external search provider API key (currently returns a placeholder error).
-- **Image Generation**: Currently being optimized for better quality.
-
-**Final Release Status**: Production Hardening Complete. Ramaibot is now secure, reliable, and accessible.
+Do not treat this file as a claim that external providers are currently online.
