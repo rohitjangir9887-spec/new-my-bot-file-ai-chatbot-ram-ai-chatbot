@@ -65,10 +65,17 @@ CREATE INDEX IF NOT EXISTS conversations_user_updated_idx ON public.conversation
 
 CREATE OR REPLACE FUNCTION public.touch_conversation_from_message()
 RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
-BEGIN
-  UPDATE public.conversations SET updated_at = NOW() WHERE id = NEW.conversation_id;
-  RETURN NEW;
-END;
+BEGIN UPDATE public.conversations SET updated_at = NOW() WHERE id = NEW.conversation_id; RETURN NEW; END;
 $$;
 DROP TRIGGER IF EXISTS on_message_touches_conversation ON public.messages;
 CREATE TRIGGER on_message_touches_conversation AFTER INSERT ON public.messages FOR EACH ROW EXECUTE PROCEDURE public.touch_conversation_from_message();
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'storage') THEN
+    DROP POLICY IF EXISTS "Users can update their own files" ON storage.objects;
+    CREATE POLICY "Users can update their own files" ON storage.objects FOR UPDATE TO authenticated
+      USING (bucket_id = 'user-files' AND (storage.foldername(name))[1] = (select auth.uid())::text)
+      WITH CHECK (bucket_id = 'user-files' AND (storage.foldername(name))[1] = (select auth.uid())::text);
+  END IF;
+END $$;
