@@ -2,6 +2,10 @@
 
 ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free', ADD COLUMN IF NOT EXISTS subscription_status TEXT NOT NULL DEFAULT 'active';
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'profiles_plan_check') THEN ALTER TABLE public.profiles ADD CONSTRAINT profiles_plan_check CHECK (plan IN ('free', 'pro', 'ultra')); END IF; END $$;
+-- Users may edit profile presentation/preferences, but never their own subscription tier.
+REVOKE INSERT ON public.profiles FROM authenticated;
+REVOKE UPDATE ON public.profiles FROM authenticated;
+GRANT UPDATE (email, full_name, avatar_url, custom_instructions) ON public.profiles TO authenticated;
 
 CREATE TABLE IF NOT EXISTS public.usage_events (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE, kind TEXT NOT NULL CHECK (kind IN ('message', 'image', 'tool', 'file')), model_id TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
 CREATE INDEX IF NOT EXISTS usage_events_user_created_idx ON public.usage_events(user_id, created_at DESC);
@@ -14,16 +18,15 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS public.user_memories (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE, content TEXT NOT NULL CHECK (char_length(btrim(content)) > 0), embedding VECTOR(1536), metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
 CREATE INDEX IF NOT EXISTS user_memories_user_idx ON public.user_memories(user_id, created_at DESC);
 ALTER TABLE public.user_memories ENABLE ROW LEVEL SECURITY;
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.user_memories TO authenticated; GRANT ALL ON public.user_memories TO service_role;
+GRANT SELECT ON public.user_memories TO authenticated; GRANT ALL ON public.user_memories TO service_role;
 DROP POLICY IF EXISTS "Users can manage their own memories" ON public.user_memories;
-CREATE POLICY "Users can manage their own memories" ON public.user_memories FOR ALL TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can view their own memories" ON public.user_memories FOR SELECT TO authenticated USING (auth.uid() = user_id);
 
 CREATE OR REPLACE FUNCTION public.match_user_memories(query_embedding VECTOR(1536), match_threshold FLOAT, match_count INTEGER, target_user_id UUID)
 RETURNS TABLE (id UUID, content TEXT, metadata JSONB, similarity FLOAT) LANGUAGE SQL STABLE SECURITY DEFINER SET search_path = public AS $$
   SELECT m.id, m.content, m.metadata, 1 - (m.embedding <=> query_embedding) AS similarity FROM public.user_memories m WHERE m.user_id = target_user_id AND m.embedding IS NOT NULL AND 1 - (m.embedding <=> query_embedding) >= match_threshold ORDER BY m.embedding <=> query_embedding LIMIT match_count;
 $$;
-REVOKE EXECUTE ON FUNCTION public.match_user_memories(VECTOR(1536), FLOAT, INTEGER, UUID) FROM public, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.match_user_memories(VECTOR(1536), FLOAT, INTEGER, UUID) TO service_role;
+REVOKE EXECUTE ON FUNCTION public.match_user_memories(VECTOR(1536), FLOAT, INTEGER, UUID) FROM public, anon, authenticated; GRANT EXECUTE ON FUNCTION public.match_user_memories(VECTOR(1536), FLOAT, INTEGER, UUID) TO service_role;
 
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'messages_role_check') THEN ALTER TABLE public.messages ADD CONSTRAINT messages_role_check CHECK (role IN ('user', 'assistant', 'system')); END IF;
