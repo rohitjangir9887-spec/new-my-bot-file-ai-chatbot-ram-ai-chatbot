@@ -1,20 +1,29 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { MODEL_CATALOG } from '@/lib/chat/provider.server';
+import { callModel, MODEL_CATALOG } from '@/lib/chat/provider.server';
+
+const cache = new Map<string, { expires: number; value: { status: 'Online' | 'Offline' | 'Error'; reason?: string } }>();
 
 async function checkModel(model: typeof MODEL_CATALOG[number]) {
-  const key = model.provider === 'nvidia' ? process.env.NVIDIA_API_KEY : model.provider === 'anthropic' ? process.env.ANTHROPIC_API_KEY : process.env.OPENAI_API_KEY;
-  if (!model.enabled || !key) return { ...model, status: 'Offline' as const, reason: 'Provider is not configured' };
+  if (!model.enabled || !model.providerModelId) {
+    return { ...model, status: 'Offline' as const, reason: 'Provider is not configured' };
+  }
+
+  const cached = cache.get(model.id);
+  if (cached && cached.expires > Date.now()) return { ...model, ...cached.value };
+
   try {
-    const endpoint = model.provider === 'anthropic'
-      ? `https://api.anthropic.com/v1/models/${encodeURIComponent(model.providerModelId)}`
-      : `${model.provider === 'nvidia' ? 'https://integrate.api.nvidia.com/v1' : 'https://api.openai.com/v1'}/models/${encodeURIComponent(model.providerModelId)}`;
-    const headers: Record<string, string> = model.provider === 'anthropic'
-      ? { 'x-api-key': key, 'anthropic-version': '2023-06-01' }
-      : { Authorization: `Bearer ${key}` };
-    const response = await fetch(endpoint, { headers, signal: AbortSignal.timeout(5000) });
-    return { ...model, status: response.ok ? 'Online' as const : 'Error' as const, reason: response.ok ? undefined : `Provider returned ${response.status}` };
-  } catch {
-    return { ...model, status: 'Error' as const, reason: 'Provider health check failed' };
+    // A minimal real generation request is the health check. A model is Online only if inference succeeds.
+    const result = await callModel(model, [{ role: 'user', content: 'Reply with OK.' }], [], AbortSignal.timeout(12000));
+    if (!result.content.trim()) throw new Error('Empty provider response');
+    const value = { status: 'Online' as const };
+    cache.set(model.id, { expires: Date.now() + 30_000, value });
+    return { ...model, ...value };
+  } catch (error: any) {
+    const status = Number(error?.status);
+    const reason = [401, 403].includes(status) ? 'Provider authentication failed' : status === 404 ? 'Model is not available' : status === 429 ? 'Provider rate limit reached' : 'Provider health check failed';
+    const value = { status: 'Error' as const, reason };
+    cache.set(model.id, { expires: Date.now() + 15_000, value });
+    return { ...model, ...value };
   }
 }
 
@@ -23,7 +32,9 @@ export const Route = createFileRoute('/api/models')({
     handlers: {
       GET: async () => {
         const models = await Promise.all(MODEL_CATALOG.map(checkModel));
-        return new Response(JSON.stringify({ models }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+        return new Response(JSON.stringify({ models }), {
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        });
       },
     },
   },
