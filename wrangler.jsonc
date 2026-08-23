@@ -1,0 +1,13 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "new-my-bot-file-ai-chatbot-ram-ai-chatbot",
+  "main": ".output/server/index.mjs",
+  "compatibility_date": "2026-08-23",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": ".output/public"
+  },
+  "observability": {
+    "enabled": true
+  }
+}
