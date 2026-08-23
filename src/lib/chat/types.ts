@@ -1,4 +1,3 @@
-
 export type MessageRole = 'user' | 'assistant' | 'system';
 
 export interface Attachment {
@@ -7,7 +6,7 @@ export interface Attachment {
   type: 'image' | 'pdf' | 'document';
   mimeType: string;
   size: number;
-  url: string; // Storage URL or local blob URL for preview
+  url: string;
   storagePath?: string;
   status: 'uploading' | 'processing' | 'ready' | 'failed';
   error?: string;
@@ -15,7 +14,7 @@ export interface Attachment {
 
 export interface ToolCall {
   id: string;
-  type: 'calculator' | 'web_search';
+  type: 'calculator' | 'web_search' | 'image_generation';
   status: 'preparing' | 'waiting_consent' | 'searching' | 'processing' | 'completed' | 'error';
   args: any;
   result?: any;
@@ -26,13 +25,11 @@ export interface ToolCall {
 export interface MessageMetadata {
   model?: string | null | undefined;
   status?: 'thinking' | 'streaming' | 'completed' | 'error' | null | undefined;
-  usage?: {
-    prompt_tokens: number;
-    completion_tokens: number;
-  } | null | undefined;
+  usage?: { prompt_tokens: number; completion_tokens: number } | null | undefined;
   error?: string | null | undefined;
-  imagePrompt?: string; // For generated images
+  imagePrompt?: string;
   toolCalls?: ToolCall[];
+  attachments?: Attachment[];
 }
 
 export interface Message {
