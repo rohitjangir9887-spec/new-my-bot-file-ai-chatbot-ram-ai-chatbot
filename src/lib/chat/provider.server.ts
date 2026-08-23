@@ -13,7 +13,6 @@ export type ModelDefinition = {
 };
 
 const env = (name: string) => process.env[name]?.trim() || '';
-const NVIDIA_BASE_URL = env('NVIDIA_API_BASE_URL') || 'https://integrate.api.nvidia.com/v1';
 
 function parseJsonObject(value: string): Record<string, unknown> {
   if (!value) return {};
@@ -27,32 +26,34 @@ function parseJsonObject(value: string): Record<string, unknown> {
   }
 }
 
-const nvidiaToolsEnabled = env('NVIDIA_MODEL_SUPPORTS_TOOLS').toLowerCase() === 'true';
-const nvidiaCapabilities: ModelCapability[] = ['chat', ...(nvidiaToolsEnabled ? (['tools'] as const) : [])];
+function buildModelCatalog(): ModelDefinition[] {
+  const nvidiaToolsEnabled = env('NVIDIA_MODEL_SUPPORTS_TOOLS').toLowerCase() === 'true';
+  const nvidiaCapabilities: ModelCapability[] = ['chat', ...(nvidiaToolsEnabled ? (['tools'] as const) : [])];
+  const catalog: ModelDefinition[] = [
+    { id: 'gpt-4o', providerModelId: 'gpt-4o', name: 'GPT-4o', provider: 'openai', capabilities: ['chat', 'vision', 'tools'], plan: 'free', enabled: !!env('OPENAI_API_KEY') },
+    { id: 'gpt-4o-mini', providerModelId: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai', capabilities: ['chat', 'vision', 'tools'], plan: 'free', enabled: !!env('OPENAI_API_KEY') },
+    { id: 'claude-3-5-sonnet', providerModelId: env('ANTHROPIC_MODEL_ID'), name: 'Claude', provider: 'anthropic', capabilities: ['chat', 'vision', 'tools'], plan: 'pro', enabled: !!env('ANTHROPIC_API_KEY') && !!env('ANTHROPIC_MODEL_ID') },
+    { id: 'nvidia-nim', providerModelId: env('NVIDIA_MODEL_ID'), name: 'NVIDIA NIM', provider: 'nvidia', capabilities: nvidiaCapabilities, plan: 'pro', enabled: !!env('NVIDIA_API_KEY') && !!env('NVIDIA_MODEL_ID') },
+  ];
+  const duplicateModelIds = catalog.filter((model, index, all) => all.findIndex(candidate => candidate.id === model.id) !== index).map(model => model.id);
+  if (duplicateModelIds.length) throw new Error('Duplicate model IDs configured');
+  return catalog;
+}
 
-export const MODEL_CATALOG: ModelDefinition[] = [
-  { id: 'gpt-4o', providerModelId: 'gpt-4o', name: 'GPT-4o', provider: 'openai', capabilities: ['chat', 'vision', 'tools'], plan: 'free', enabled: !!env('OPENAI_API_KEY') },
-  { id: 'gpt-4o-mini', providerModelId: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai', capabilities: ['chat', 'vision', 'tools'], plan: 'free', enabled: !!env('OPENAI_API_KEY') },
-  { id: 'claude-3-5-sonnet', providerModelId: env('ANTHROPIC_MODEL_ID'), name: 'Claude', provider: 'anthropic', capabilities: ['chat', 'vision', 'tools'], plan: 'pro', enabled: !!env('ANTHROPIC_API_KEY') && !!env('ANTHROPIC_MODEL_ID') },
-  { id: 'nvidia-nim', providerModelId: env('NVIDIA_MODEL_ID'), name: 'NVIDIA NIM', provider: 'nvidia', capabilities: nvidiaCapabilities, plan: 'pro', enabled: !!env('NVIDIA_API_KEY') && !!env('NVIDIA_MODEL_ID') },
-];
+export function getModelCatalog() { return buildModelCatalog(); }
 
-const duplicateModelIds = MODEL_CATALOG.filter((model, index, all) => all.findIndex(candidate => candidate.id === model.id) !== index).map(model => model.id);
-if (duplicateModelIds.length) throw new Error(`Duplicate model IDs configured: ${[...new Set(duplicateModelIds)].join(', ')}`);
-
-export const publicModelCatalog = MODEL_CATALOG.map(({ id, providerModelId, name, provider, capabilities, plan, enabled }) => ({ id, providerModelId, name, provider, capabilities, plan, enabled }));
-
-export function getModel(id: string) { return MODEL_CATALOG.find(model => model.id === id); }
+export function getModel(id: string) { return buildModelCatalog().find(model => model.id === id); }
 
 export function getFallbackModels(selectedId: string) {
-  const selected = getModel(selectedId);
-  const enabled = MODEL_CATALOG.filter(model => model.enabled && model.capabilities.includes('chat'));
+  const catalog = buildModelCatalog();
+  const selected = catalog.find(model => model.id === selectedId);
+  const enabled = catalog.filter(model => model.enabled && model.capabilities.includes('chat'));
   const ordered = selected?.enabled ? [selected, ...enabled.filter(model => model.id !== selected.id)] : enabled;
   return [...new Map(ordered.map(model => [model.id, model])).values()];
 }
 
 function endpointFor(model: ModelDefinition) {
-  if (model.provider === 'nvidia') return `${NVIDIA_BASE_URL.replace(/\/$/, '')}/chat/completions`;
+  if (model.provider === 'nvidia') return `${(env('NVIDIA_API_BASE_URL') || 'https://integrate.api.nvidia.com/v1').replace(/\/$/, '')}/chat/completions`;
   if (model.provider === 'anthropic') return 'https://api.anthropic.com/v1/messages';
   return 'https://api.openai.com/v1/chat/completions';
 }
@@ -87,7 +88,6 @@ async function callOpenAICompatible(model: ModelDefinition, messages: any[], too
   const nvidiaMaxTokens = model.provider === 'nvidia' && env('NVIDIA_MAX_TOKENS') ? Number(env('NVIDIA_MAX_TOKENS')) : 4096;
   const requestBody: Record<string, unknown> = { model: model.providerModelId, messages, stream: false, max_tokens: Number.isFinite(nvidiaMaxTokens) && nvidiaMaxTokens > 0 ? nvidiaMaxTokens : 4096, ...configuredOptions };
   if (tools.length && model.capabilities.includes('tools')) { requestBody.tools = tools; requestBody.tool_choice = 'auto'; }
-
   const response = await fetch(endpointFor(model), { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` }, body: JSON.stringify(requestBody), signal: timeoutSignal(signal) });
   const text = await response.text();
   let body: any = null;
