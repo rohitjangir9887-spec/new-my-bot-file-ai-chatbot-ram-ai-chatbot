@@ -16,24 +16,36 @@ export async function uploadFile(file: File, userId: string, onProgress?: (progr
   const extension = file.name.split('.').pop()?.toLowerCase() || 'bin';
   const filePath = `${userId}/${crypto.randomUUID()}.${extension}`;
   onProgress?.(10);
-  const { data, error } = await supabase.storage.from('user-files').upload(filePath, file, { cacheControl: '3600', upsert: false });
-  if (error) throw new Error('File upload failed');
-  onProgress?.(70);
 
-  const { data: fileData, error: dbError } = await supabase.from('user_files').insert({ user_id: userId, storage_path: data.path, filename: file.name, mime_type: file.type, size_bytes: file.size }).select().single();
-  if (dbError) {
-    await supabase.storage.from('user-files').remove([data.path]);
-    throw new Error('File could not be saved');
-  }
+  // Reserve the user's stored-file slot before uploading. The RLS function serializes concurrent reservations.
+  const { data: fileData, error: reservationError } = await supabase.from('user_files').insert({
+    user_id: userId,
+    storage_path: filePath,
+    filename: file.name,
+    mime_type: file.type,
+    size_bytes: file.size,
+    metadata: { status: 'uploading' },
+  }).select().single();
+  if (reservationError || !fileData) throw new Error('File limit reached or file could not be reserved');
 
-  const { data: urlData, error: urlError } = await supabase.storage.from('user-files').createSignedUrl(data.path, 3600);
-  if (urlError) {
+  try {
+    onProgress?.(20);
+    const { data, error } = await supabase.storage.from('user-files').upload(filePath, file, { cacheControl: '3600', upsert: false });
+    if (error) throw new Error('File upload failed');
+    onProgress?.(70);
+
+    const { error: finalizeError } = await supabase.from('user_files').update({ metadata: { status: 'ready' } }).eq('id', fileData.id).eq('user_id', userId);
+    if (finalizeError) throw new Error('File could not be finalized');
+
+    const { data: urlData, error: urlError } = await supabase.storage.from('user-files').createSignedUrl(data.path, 3600);
+    if (urlError) throw new Error('File URL could not be created');
+    onProgress?.(100);
+    return { url: urlData.signedUrl, path: data.path, id: fileData.id };
+  } catch (error) {
     await supabase.from('user_files').delete().eq('id', fileData.id).eq('user_id', userId);
-    await supabase.storage.from('user-files').remove([data.path]);
-    throw new Error('File URL could not be created');
+    await supabase.storage.from('user-files').remove([filePath]);
+    throw error instanceof Error ? error : new Error('File upload failed');
   }
-  onProgress?.(100);
-  return { url: urlData.signedUrl, path: data.path, id: fileData.id };
 }
 
 export async function getFileSignedUrl(path: string): Promise<string> {
