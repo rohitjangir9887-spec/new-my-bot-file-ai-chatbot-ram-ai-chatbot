@@ -3,46 +3,75 @@ import { supabaseAdmin } from '@/integrations/supabase/client.server';
 import { z } from 'zod';
 import { callModel, getFallbackModels, getModel } from '@/lib/chat/provider.server';
 import { safeCalculator } from '@/lib/security/safeCalculator';
+import { generateImageServer } from '@/lib/chat/image-gen.server';
+import { consumeUsage, getUserPlan, PLAN_LIMITS } from '@/lib/usage/limits.server';
 
 const requestSchema = z.object({
   conversationId: z.string().uuid(),
   modelId: z.string().min(1),
   messages: z.array(z.object({
     role: z.enum(['user', 'assistant', 'system']),
-    content: z.string(),
+    content: z.string().max(100_000),
     attachments: z.array(z.any()).optional(),
-  })).min(1),
+  })).min(1).max(50),
 });
 
 const tools = [
-  { type: 'function', function: { name: 'calculator', description: 'Evaluate a mathematical expression safely.', parameters: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] } } },
-  { type: 'function', function: { name: 'web_search', description: 'Search the live web for current information. Use only when current information is needed.', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'calculator', description: 'Evaluate a mathematical expression safely.', parameters: { type: 'object', properties: { expression: { type: 'string', maxLength: 200 } }, required: ['expression'] } } },
+  { type: 'function', function: { name: 'web_search', description: 'Search the live web for current information. Use only when current information is needed.', parameters: { type: 'object', properties: { query: { type: 'string', minLength: 1, maxLength: 500 } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'generate_image', description: 'Generate an actual image when the user asks to create or generate an image.', parameters: { type: 'object', properties: { prompt: { type: 'string', minLength: 1, maxLength: 4000 }, aspectRatio: { type: 'string', enum: ['1:1', '16:9', '9:16'] } }, required: ['prompt'] } } },
 ];
 
 function publicError(status: number) {
-  if ([401, 403, 404, 408, 429, 500, 502, 503, 504].includes(status)) return 'Ramaibot couldn\'t generate a response.';
+  if (status === 429) return 'Ramaibot couldn\'t generate a response.';
   return 'Ramaibot couldn\'t generate a response.';
 }
+
+function planRank(plan: 'free' | 'pro' | 'ultra') { return plan === 'ultra' ? 2 : plan === 'pro' ? 1 : 0; }
 
 async function runWebSearch(query: string) {
   const key = process.env.TAVILY_API_KEY?.trim();
   if (!key) return { error: 'Live web search is currently unavailable.' };
-  const response = await fetch('https://api.tavily.com/search', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ api_key: key, query, search_depth: 'basic', max_results: 5 }),
-    signal: AbortSignal.timeout(8000),
-  });
-  if (!response.ok) return { error: 'Live web search is currently unavailable.' };
-  const body: any = await response.json().catch(() => null);
-  return { results: Array.isArray(body?.results) ? body.results.map((r: any) => ({ title: r.title, url: r.url, content: r.content })) : [] };
+  try {
+    const response = await fetch('https://api.tavily.com/search', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: key, query: query.trim(), search_depth: 'basic', max_results: 5 }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!response.ok) return { error: 'Live web search is currently unavailable.' };
+    const body: any = await response.json().catch(() => null);
+    return { results: Array.isArray(body?.results) ? body.results.map((r: any) => ({ title: r.title, url: r.url, content: r.content })) : [] };
+  } catch {
+    return { error: 'Live web search is currently unavailable.' };
+  }
 }
 
-async function executeTool(name: string, args: any) {
+async function executeTool(name: string, args: any, userId: string, conversationId: string) {
   if (name === 'calculator') {
     try { return { result: safeCalculator(String(args?.expression || '')) }; }
     catch { return { error: 'The calculator could not evaluate that expression.' }; }
   }
   if (name === 'web_search') return runWebSearch(String(args?.query || ''));
+  if (name === 'generate_image') {
+    try {
+      const result = await generateImageServer(String(args?.prompt || ''), args?.aspectRatio || '1:1', conversationId);
+      return {
+        image: {
+          id: result.fileId,
+          name: `Generated image`,
+          type: 'image',
+          mimeType: result.mimeType,
+          size: result.sizeBytes,
+          url: result.url,
+          storagePath: result.storagePath,
+          status: 'ready',
+        },
+        prompt: result.prompt,
+      };
+    } catch (error: any) {
+      return { error: 'Image generation is currently unavailable.' };
+    }
+  }
   return { error: 'Tool unavailable.' };
 }
 
@@ -52,31 +81,38 @@ export const Route = createFileRoute('/api/chat/stream')({
       POST: async ({ request }) => {
         try {
           const authHeader = request.headers.get('Authorization');
-          if (!authHeader?.startsWith('Bearer ')) return new Response(JSON.stringify({ error: 'Ramaibot couldn\'t generate a response.' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+          if (!authHeader?.startsWith('Bearer ')) return new Response(JSON.stringify({ error: publicError(401) }), { status: 401, headers: { 'Content-Type': 'application/json' } });
           const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(authHeader.slice(7));
-          if (authError || !user) return new Response(JSON.stringify({ error: 'Ramaibot couldn\'t generate a response.' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+          if (authError || !user) return new Response(JSON.stringify({ error: publicError(401) }), { status: 401, headers: { 'Content-Type': 'application/json' } });
 
           const body = requestSchema.parse(await request.json());
-          const { data: conversation } = await supabaseAdmin.from('conversations').select('user_id').eq('id', body.conversationId).single();
-          if (!conversation) return new Response(JSON.stringify({ error: 'Ramaibot couldn\'t generate a response.' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-          if (conversation.user_id !== user.id) return new Response(JSON.stringify({ error: 'Ramaibot couldn\'t generate a response.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+          const { data: conversation } = await supabaseAdmin.from('conversations').select('user_id').eq('id', body.conversationId).maybeSingle();
+          if (!conversation) return new Response(JSON.stringify({ error: publicError(404) }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+          if (conversation.user_id !== user.id) return new Response(JSON.stringify({ error: publicError(403) }), { status: 403, headers: { 'Content-Type': 'application/json' } });
 
-          const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-          const { count } = await supabaseAdmin.from('messages').select('id', { count: 'exact', head: true }).eq('role', 'user').gte('created_at', oneHourAgo).in('conversation_id', [body.conversationId]);
-          if ((count || 0) >= 50) return new Response(JSON.stringify({ error: 'Ramaibot couldn\'t generate a response.' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+          const plan = await getUserPlan(user.id);
+          const usage = await consumeUsage(user.id, 'message', body.modelId);
+          if (!usage.allowed) {
+            return new Response(JSON.stringify({ error: 'Your plan limit has been reached. Upgrade your plan to continue.' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+          }
 
           const selected = getModel(body.modelId);
-          if (!selected) return new Response(JSON.stringify({ error: 'Ramaibot couldn\'t generate a response.' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+          if (!selected) return new Response(JSON.stringify({ error: publicError(404) }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+          if (planRank(plan) < planRank(selected.plan)) {
+            return new Response(JSON.stringify({ error: 'This model requires a paid plan.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+          }
 
-          const candidates = getFallbackModels(selected.id);
+          const candidates = getFallbackModels(selected.id).filter(candidate => candidate.enabled && planRank(plan) >= planRank(candidate.plan));
           let lastStatus = 503;
           let result: any = null;
           let usedModel = selected;
+          let usedToolCalls: any[] = [];
+          let attachments: any[] = [];
 
-          for (const candidate of candidates) {
-            if (!candidate.enabled) continue;
+          for (const candidate of candidates.slice(0, 4)) {
             try {
               let messages: any[] = body.messages.map(m => ({ role: m.role, content: m.content }));
+              result = null;
               for (let round = 0; round < 3; round++) {
                 result = await callModel(candidate, messages, tools, request.signal);
                 if (!result.toolCalls?.length) break;
@@ -84,13 +120,21 @@ export const Route = createFileRoute('/api/chat/stream')({
                 for (const call of result.toolCalls) {
                   let args: any = {};
                   try { args = JSON.parse(call.function?.arguments || '{}'); } catch { args = {}; }
-                  const toolResult = await executeTool(call.function?.name || '', args);
+                  const toolUsage = await consumeUsage(user.id, 'tool', candidate.id);
+                  if (!toolUsage.allowed) {
+                    messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: 'Tool limit reached for this plan.' }) });
+                    continue;
+                  }
+                  const toolResult = await executeTool(call.function?.name || '', args, user.id, body.conversationId);
+                  usedToolCalls.push({ id: call.id, type: call.function?.name, status: toolResult?.error ? 'error' : 'completed', args, result: toolResult });
+                  if (toolResult?.image) attachments.push(toolResult.image);
                   messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(toolResult) });
                 }
               }
               if (result?.content?.trim()) { usedModel = candidate; break; }
               lastStatus = 502;
             } catch (error: any) {
+              if (error?.name === 'AbortError') throw error;
               lastStatus = Number(error?.status) || 503;
             }
           }
@@ -100,23 +144,35 @@ export const Route = createFileRoute('/api/chat/stream')({
           }
 
           const content = result.content.trim();
+          const metadata = { model: usedModel.id, provider: usedModel.provider, status: 'completed', usage: result.usage, toolCalls: usedToolCalls, attachments };
+          const { data: persisted, error: persistenceError } = await supabaseAdmin.from('messages').insert({
+            conversation_id: body.conversationId,
+            role: 'assistant',
+            content,
+            metadata,
+            attachments,
+          }).select('id').single();
+          if (persistenceError || !persisted) {
+            return new Response(JSON.stringify({ error: publicError(500) }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+          }
+
           const encoder = new TextEncoder();
           const stream = new ReadableStream({
             start(controller) {
               const chunkSize = 80;
               for (let i = 0; i < content.length; i += chunkSize) {
-                const piece = content.slice(i, i + chunkSize);
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: piece } }] })}\n\n`));
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: content.slice(i, i + chunkSize) } }] })}\n\n`));
               }
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ meta: { model: usedModel.id, provider: usedModel.provider, usage: result.usage } })}\n\n`));
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ meta: { messageId: persisted.id, model: usedModel.id, provider: usedModel.provider, usage: result.usage, attachments } })}\n\n`));
               controller.enqueue(encoder.encode('data: [DONE]\n\n'));
               controller.close();
             },
           });
           return new Response(stream, { headers: { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Ramaibot-Model': usedModel.id, 'X-Ramaibot-Provider': usedModel.provider } });
         } catch (error: any) {
-          console.error('Chat request failed', { status: error?.status, code: error?.code });
+          if (error?.name === 'AbortError') return new Response(JSON.stringify({ error: publicError(408) }), { status: 408, headers: { 'Content-Type': 'application/json' } });
           const status = error?.name === 'ZodError' ? 400 : 500;
+          console.error('Chat request failed', { status, code: error?.code });
           return new Response(JSON.stringify({ error: publicError(status) }), { status, headers: { 'Content-Type': 'application/json' } });
         }
       },
