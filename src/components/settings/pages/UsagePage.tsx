@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { SettingsLayout } from "../SettingsLayout";
+import { SettingsLayout } from "../shared/SettingsLayout";
 import { SettingsGroup } from "../shared/SettingsGroup";
 import { SettingsRow } from "../shared/SettingsRow";
 import { BarChart3, MessageSquare, Zap, Database, Clock, Loader2 } from "lucide-react";
