@@ -19,6 +19,8 @@ export async function generateImageServer(prompt: string, aspectRatio: '1:1' | '
   if (!prompt.trim() || prompt.length > 4000) throw new Error('INVALID_IMAGE_PROMPT');
   const usage = await consumeUsage(user.id, 'image');
   if (!usage.allowed) throw new Error('IMAGE_LIMIT_REACHED');
+  const fileQuota = await consumeUsage(user.id, 'file');
+  if (!fileQuota.allowed) throw new Error('FILE_LIMIT_REACHED');
 
   try {
     const aiResponse = await fetch('https://api.lovable.ai/v1/images/generations', {
@@ -40,7 +42,7 @@ export async function generateImageServer(prompt: string, aspectRatio: '1:1' | '
     if (signedUrlError || !signedUrlData?.signedUrl) throw new Error('IMAGE_URL_FAILED');
     return { success: true, url: signedUrlData.signedUrl, storagePath, fileId: fileRecord.id, sizeBytes: buffer.length, mimeType: 'image/png', prompt: prompt.trim() };
   } catch (error: any) {
-    const safeCodes = new Set(['IMAGE_GENERATION_NOT_CONFIGURED', 'IMAGE_LIMIT_REACHED', 'IMAGE_PROVIDER_FAILED', 'IMAGE_PROVIDER_EMPTY', 'IMAGE_STORAGE_FAILED', 'IMAGE_URL_FAILED', 'INVALID_IMAGE_PROMPT']);
+    const safeCodes = new Set(['IMAGE_GENERATION_NOT_CONFIGURED', 'IMAGE_LIMIT_REACHED', 'FILE_LIMIT_REACHED', 'IMAGE_PROVIDER_FAILED', 'IMAGE_PROVIDER_EMPTY', 'IMAGE_STORAGE_FAILED', 'IMAGE_URL_FAILED', 'INVALID_IMAGE_PROMPT']);
     throw new Error(safeCodes.has(error?.message) ? error.message : 'IMAGE_GENERATION_FAILED');
   }
 }
