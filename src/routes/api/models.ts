@@ -1,10 +1,11 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { callModel, MODEL_CATALOG } from '@/lib/chat/provider.server';
+import { callModel, getModelCatalog } from '@/lib/chat/provider.server';
 import { supabaseAdmin } from '@/integrations/supabase/client.server';
+import type { ModelDefinition } from '@/lib/chat/provider.server';
 
 const cache = new Map<string, { expires: number; value: { status: 'Online' | 'Offline' | 'Error'; reason?: string } }>();
 
-async function checkModel(model: typeof MODEL_CATALOG[number]) {
+async function checkModel(model: ModelDefinition) {
   if (!model.enabled || !model.providerModelId) return { ...model, status: 'Offline' as const, reason: 'Provider is not configured' };
   const cached = cache.get(model.id);
   if (cached && cached.expires > Date.now()) return { ...model, ...cached.value };
@@ -31,7 +32,7 @@ export const Route = createFileRoute('/api/models')({
         if (!authHeader?.startsWith('Bearer ')) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
         const { data: { user } } = await supabaseAdmin.auth.getUser(authHeader.slice(7));
         if (!user) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
-        const models = await Promise.all(MODEL_CATALOG.map(checkModel));
+        const models = await Promise.all(getModelCatalog().map(checkModel));
         return new Response(JSON.stringify({ models }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
       },
     },
