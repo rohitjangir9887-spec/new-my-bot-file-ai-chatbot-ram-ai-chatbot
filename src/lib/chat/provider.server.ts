@@ -23,12 +23,15 @@ async function callOpenAICompatible(model: ModelDefinition, messages: any[], too
 }
 
 async function callAnthropic(model: ModelDefinition, messages: any[], tools: any[], signal?: AbortSignal) {
-  const key = env('ANTHROPIC_API_KEY); if (!key) throw Object.assign(new Error('Provider unavailable'), { code: 'PROVIDER_UNAVAILABLE', status: 503 });
+  const key = env('ANTHROPIC_API_KEY'); if (!key) throw Object.assign(new Error('Provider unavailable'), { code: 'PROVIDER_UNAVAILABLE', status: 503 });
   const system = messages.filter(m => m.role === 'system').map(m => m.content).join('\n');
   const input: any[] = [];
   for (const message of messages.filter(m => m.role !== 'system')) {
     if (message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length) {
-      input.push({ role: 'assistant', content: [{ ...(message.content ? { type: 'text', text: message.content } : {}), ...{} }, ...message.tool_calls.map((call: any) => ({ type: 'tool_use', id: call.id, name: call.function.name, input: JSON.parse(call.function.arguments || '{}') }))].filter(Boolean) });
+      const blocks: any[] = [];
+      if (message.content) blocks.push({ type: 'text', text: message.content });
+      for (const call of message.tool_calls) blocks.push({ type: 'tool_use', id: call.id, name: call.function.name, input: JSON.parse(call.function.arguments || '{}') });
+      input.push({ role: 'assistant', content: blocks });
     } else if (message.role === 'tool') {
       input.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: message.tool_call_id, content: message.content }] });
     } else {
