@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { callModel, getFallbackModels, getModel } from '@/lib/chat/provider.server';
 import { safeCalculator } from '@/lib/security/safeCalculator';
 import { generateImageServer } from '@/lib/chat/image-gen.server';
-import { consumeUsage, getUserPlan, PLAN_LIMITS } from '@/lib/usage/limits.server';
+import { consumeUsage, getUserPlan } from '@/lib/usage/limits.server';
 
 const requestSchema = z.object({
   conversationId: z.string().uuid(),
@@ -22,11 +22,7 @@ const tools = [
   { type: 'function', function: { name: 'generate_image', description: 'Generate an actual image when the user asks to create or generate an image.', parameters: { type: 'object', properties: { prompt: { type: 'string', minLength: 1, maxLength: 4000 }, aspectRatio: { type: 'string', enum: ['1:1', '16:9', '9:16'] } }, required: ['prompt'] } } },
 ];
 
-function publicError(status: number) {
-  if (status === 429) return 'Ramaibot couldn\'t generate a response.';
-  return 'Ramaibot couldn\'t generate a response.';
-}
-
+function publicError() { return 'Ramaibot couldn\'t generate a response.'; }
 function planRank(plan: 'free' | 'pro' | 'ultra') { return plan === 'ultra' ? 2 : plan === 'pro' ? 1 : 0; }
 
 async function runWebSearch(query: string) {
@@ -46,7 +42,7 @@ async function runWebSearch(query: string) {
   }
 }
 
-async function executeTool(name: string, args: any, userId: string, conversationId: string) {
+async function executeTool(name: string, args: any, conversationId: string) {
   if (name === 'calculator') {
     try { return { result: safeCalculator(String(args?.expression || '')) }; }
     catch { return { error: 'The calculator could not evaluate that expression.' }; }
@@ -58,7 +54,7 @@ async function executeTool(name: string, args: any, userId: string, conversation
       return {
         image: {
           id: result.fileId,
-          name: `Generated image`,
+          name: 'Generated image',
           type: 'image',
           mimeType: result.mimeType,
           size: result.sizeBytes,
@@ -68,7 +64,7 @@ async function executeTool(name: string, args: any, userId: string, conversation
         },
         prompt: result.prompt,
       };
-    } catch (error: any) {
+    } catch {
       return { error: 'Image generation is currently unavailable.' };
     }
   }
@@ -81,38 +77,40 @@ export const Route = createFileRoute('/api/chat/stream')({
       POST: async ({ request }) => {
         try {
           const authHeader = request.headers.get('Authorization');
-          if (!authHeader?.startsWith('Bearer ')) return new Response(JSON.stringify({ error: publicError(401) }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+          if (!authHeader?.startsWith('Bearer ')) return new Response(JSON.stringify({ error: publicError() }), { status: 401, headers: { 'Content-Type': 'application/json' } });
           const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(authHeader.slice(7));
-          if (authError || !user) return new Response(JSON.stringify({ error: publicError(401) }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+          if (authError || !user) return new Response(JSON.stringify({ error: publicError() }), { status: 401, headers: { 'Content-Type': 'application/json' } });
 
           const body = requestSchema.parse(await request.json());
           const { data: conversation } = await supabaseAdmin.from('conversations').select('user_id').eq('id', body.conversationId).maybeSingle();
-          if (!conversation) return new Response(JSON.stringify({ error: publicError(404) }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-          if (conversation.user_id !== user.id) return new Response(JSON.stringify({ error: publicError(403) }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+          if (!conversation) return new Response(JSON.stringify({ error: publicError() }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+          if (conversation.user_id !== user.id) return new Response(JSON.stringify({ error: publicError() }), { status: 403, headers: { 'Content-Type': 'application/json' } });
 
+          const selected = getModel(body.modelId);
+          if (!selected) return new Response(JSON.stringify({ error: publicError() }), { status: 404, headers: { 'Content-Type': 'application/json' } });
           const plan = await getUserPlan(user.id);
+          if (planRank(plan) < planRank(selected.plan)) {
+            return new Response(JSON.stringify({ error: 'This model requires a paid plan.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+          }
+
           const usage = await consumeUsage(user.id, 'message', body.modelId);
           if (!usage.allowed) {
             return new Response(JSON.stringify({ error: 'Your plan limit has been reached. Upgrade your plan to continue.' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
           }
 
-          const selected = getModel(body.modelId);
-          if (!selected) return new Response(JSON.stringify({ error: publicError(404) }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-          if (planRank(plan) < planRank(selected.plan)) {
-            return new Response(JSON.stringify({ error: 'This model requires a paid plan.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
-          }
-
-          const candidates = getFallbackModels(selected.id).filter(candidate => candidate.enabled && planRank(plan) >= planRank(candidate.plan));
+          const candidates = getFallbackModels(selected.id).filter(candidate => candidate.enabled && planRank(plan) >= planRank(candidate.plan)).slice(0, 4);
           let lastStatus = 503;
           let result: any = null;
           let usedModel = selected;
           let usedToolCalls: any[] = [];
           let attachments: any[] = [];
 
-          for (const candidate of candidates.slice(0, 4)) {
+          for (const candidate of candidates) {
             try {
               let messages: any[] = body.messages.map(m => ({ role: m.role, content: m.content }));
               result = null;
+              usedToolCalls = [];
+              attachments = [];
               for (let round = 0; round < 3; round++) {
                 result = await callModel(candidate, messages, tools, request.signal);
                 if (!result.toolCalls?.length) break;
@@ -121,11 +119,9 @@ export const Route = createFileRoute('/api/chat/stream')({
                   let args: any = {};
                   try { args = JSON.parse(call.function?.arguments || '{}'); } catch { args = {}; }
                   const toolUsage = await consumeUsage(user.id, 'tool', candidate.id);
-                  if (!toolUsage.allowed) {
-                    messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: 'Tool limit reached for this plan.' }) });
-                    continue;
-                  }
-                  const toolResult = await executeTool(call.function?.name || '', args, user.id, body.conversationId);
+                  const toolResult = toolUsage.allowed
+                    ? await executeTool(call.function?.name || '', args, body.conversationId)
+                    : { error: 'Tool limit reached for this plan.' };
                   usedToolCalls.push({ id: call.id, type: call.function?.name, status: toolResult?.error ? 'error' : 'completed', args, result: toolResult });
                   if (toolResult?.image) attachments.push(toolResult.image);
                   messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(toolResult) });
@@ -152,17 +148,12 @@ export const Route = createFileRoute('/api/chat/stream')({
             metadata,
             attachments,
           }).select('id').single();
-          if (persistenceError || !persisted) {
-            return new Response(JSON.stringify({ error: publicError(500) }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-          }
+          if (persistenceError || !persisted) return new Response(JSON.stringify({ error: publicError() }), { status: 500, headers: { 'Content-Type': 'application/json' } });
 
           const encoder = new TextEncoder();
           const stream = new ReadableStream({
             start(controller) {
-              const chunkSize = 80;
-              for (let i = 0; i < content.length; i += chunkSize) {
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: content.slice(i, i + chunkSize) } }] })}\n\n`));
-              }
+              for (let i = 0; i < content.length; i += 80) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: content.slice(i, i + 80) } }] })}\n\n`));
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({ meta: { messageId: persisted.id, model: usedModel.id, provider: usedModel.provider, usage: result.usage, attachments } })}\n\n`));
               controller.enqueue(encoder.encode('data: [DONE]\n\n'));
               controller.close();
@@ -170,10 +161,10 @@ export const Route = createFileRoute('/api/chat/stream')({
           });
           return new Response(stream, { headers: { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Ramaibot-Model': usedModel.id, 'X-Ramaibot-Provider': usedModel.provider } });
         } catch (error: any) {
-          if (error?.name === 'AbortError') return new Response(JSON.stringify({ error: publicError(408) }), { status: 408, headers: { 'Content-Type': 'application/json' } });
+          if (error?.name === 'AbortError') return new Response(JSON.stringify({ error: publicError() }), { status: 408, headers: { 'Content-Type': 'application/json' } });
           const status = error?.name === 'ZodError' ? 400 : 500;
           console.error('Chat request failed', { status, code: error?.code });
-          return new Response(JSON.stringify({ error: publicError(status) }), { status, headers: { 'Content-Type': 'application/json' } });
+          return new Response(JSON.stringify({ error: publicError() }), { status, headers: { 'Content-Type': 'application/json' } });
         }
       },
     },
