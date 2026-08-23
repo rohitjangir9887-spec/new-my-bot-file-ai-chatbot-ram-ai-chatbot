@@ -23,8 +23,7 @@ ALTER TABLE public.usage_events ENABLE ROW LEVEL SECURITY;
 GRANT SELECT ON public.usage_events TO authenticated;
 GRANT ALL ON public.usage_events TO service_role;
 DROP POLICY IF EXISTS "Users can view their own usage" ON public.usage_events;
-CREATE POLICY "Users can view their own usage" ON public.usage_events
-  FOR SELECT TO authenticated USING (auth.uid() = user_id);
+CREATE POLICY "Users can view their own usage" ON public.usage_events FOR SELECT TO authenticated USING (auth.uid() = user_id);
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS public.user_memories (
@@ -41,8 +40,21 @@ ALTER TABLE public.user_memories ENABLE ROW LEVEL SECURITY;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.user_memories TO authenticated;
 GRANT ALL ON public.user_memories TO service_role;
 DROP POLICY IF EXISTS "Users can manage their own memories" ON public.user_memories;
-CREATE POLICY "Users can manage their own memories" ON public.user_memories
-  FOR ALL TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can manage their own memories" ON public.user_memories FOR ALL TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+
+CREATE OR REPLACE FUNCTION public.match_user_memories(query_embedding VECTOR(1536), match_threshold FLOAT, match_count INTEGER, target_user_id UUID)
+RETURNS TABLE (id UUID, content TEXT, metadata JSONB, similarity FLOAT)
+LANGUAGE SQL STABLE SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT m.id, m.content, m.metadata, 1 - (m.embedding <=> query_embedding) AS similarity
+  FROM public.user_memories m
+  WHERE m.user_id = target_user_id AND m.embedding IS NOT NULL
+    AND 1 - (m.embedding <=> query_embedding) >= match_threshold
+  ORDER BY m.embedding <=> query_embedding
+  LIMIT match_count;
+$$;
+REVOKE EXECUTE ON FUNCTION public.match_user_memories(VECTOR(1536), FLOAT, INTEGER, UUID) FROM public, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.match_user_memories(VECTOR(1536), FLOAT, INTEGER, UUID) TO service_role;
 
 DO $$
 BEGIN
@@ -55,25 +67,14 @@ BEGIN
 END $$;
 
 CREATE OR REPLACE FUNCTION public.can_insert_user_message(_conversation_id UUID)
-RETURNS BOOLEAN
-LANGUAGE plpgsql
-STABLE
-SECURITY DEFINER
-SET search_path = public
-AS $$
-DECLARE
-  owner_id UUID;
-  user_plan TEXT;
-  max_messages INTEGER;
-  recent_count INTEGER;
+RETURNS BOOLEAN LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+DECLARE owner_id UUID; user_plan TEXT; max_messages INTEGER; recent_count INTEGER;
 BEGIN
   SELECT user_id INTO owner_id FROM public.conversations WHERE id = _conversation_id;
   IF owner_id IS NULL OR owner_id <> auth.uid() THEN RETURN FALSE; END IF;
   SELECT plan INTO user_plan FROM public.profiles WHERE id = auth.uid();
   max_messages := CASE user_plan WHEN 'ultra' THEN 5000 WHEN 'pro' THEN 500 ELSE 25 END;
-  SELECT COUNT(*) INTO recent_count FROM public.messages
-    WHERE conversation_id IN (SELECT id FROM public.conversations WHERE user_id = auth.uid())
-      AND role = 'user' AND created_at >= NOW() - INTERVAL '24 hours';
+  SELECT COUNT(*) INTO recent_count FROM public.messages WHERE conversation_id IN (SELECT id FROM public.conversations WHERE user_id = auth.uid()) AND role = 'user' AND created_at >= NOW() - INTERVAL '24 hours';
   RETURN recent_count < max_messages;
 END;
 $$;
@@ -81,37 +82,25 @@ REVOKE EXECUTE ON FUNCTION public.can_insert_user_message(UUID) FROM public, ano
 GRANT EXECUTE ON FUNCTION public.can_insert_user_message(UUID) TO authenticated, service_role;
 
 DROP POLICY IF EXISTS "Users can insert messages into their conversations" ON public.messages;
-CREATE POLICY "Users can insert user messages into their conversations" ON public.messages
-  FOR INSERT TO authenticated
-  WITH CHECK (
-    role = 'user'
-    AND public.can_insert_user_message(conversation_id)
-    AND EXISTS (SELECT 1 FROM public.conversations c WHERE c.id = messages.conversation_id AND c.user_id = auth.uid())
-  );
-
+CREATE POLICY "Users can insert user messages into their conversations" ON public.messages FOR INSERT TO authenticated WITH CHECK (
+  role = 'user' AND public.can_insert_user_message(conversation_id) AND EXISTS (SELECT 1 FROM public.conversations c WHERE c.id = messages.conversation_id AND c.user_id = auth.uid())
+);
 DROP POLICY IF EXISTS "Users can update messages in their conversations" ON public.messages;
-CREATE POLICY "Users can update messages in their conversations" ON public.messages
-  FOR UPDATE TO authenticated USING (
-    EXISTS (SELECT 1 FROM public.conversations c WHERE c.id = messages.conversation_id AND c.user_id = auth.uid())
-  ) WITH CHECK (
-    EXISTS (SELECT 1 FROM public.conversations c WHERE c.id = messages.conversation_id AND c.user_id = auth.uid())
-  );
+CREATE POLICY "Users can update messages in their conversations" ON public.messages FOR UPDATE TO authenticated USING (
+  EXISTS (SELECT 1 FROM public.conversations c WHERE c.id = messages.conversation_id AND c.user_id = auth.uid())
+) WITH CHECK (
+  EXISTS (SELECT 1 FROM public.conversations c WHERE c.id = messages.conversation_id AND c.user_id = auth.uid())
+);
 DROP POLICY IF EXISTS "Users can delete messages in their conversations" ON public.messages;
-CREATE POLICY "Users can delete messages in their conversations" ON public.messages
-  FOR DELETE TO authenticated USING (
-    EXISTS (SELECT 1 FROM public.conversations c WHERE c.id = messages.conversation_id AND c.user_id = auth.uid())
-  );
+CREATE POLICY "Users can delete messages in their conversations" ON public.messages FOR DELETE TO authenticated USING (
+  EXISTS (SELECT 1 FROM public.conversations c WHERE c.id = messages.conversation_id AND c.user_id = auth.uid())
+);
 
-INSERT INTO storage.buckets (id, name, public)
-VALUES ('user-files', 'user-files', false)
-ON CONFLICT (id) DO NOTHING;
+INSERT INTO storage.buckets (id, name, public) VALUES ('user-files', 'user-files', false) ON CONFLICT (id) DO NOTHING;
 DROP POLICY IF EXISTS "Users can update their own files" ON storage.objects;
-CREATE POLICY "Users can update their own files" ON storage.objects
-  FOR UPDATE TO authenticated
+CREATE POLICY "Users can update their own files" ON storage.objects FOR UPDATE TO authenticated
   USING (bucket_id = 'user-files' AND (storage.foldername(name))[1] = auth.uid()::text)
   WITH CHECK (bucket_id = 'user-files' AND (storage.foldername(name))[1] = auth.uid()::text);
 
 DROP TRIGGER IF EXISTS on_memory_updated ON public.user_memories;
-CREATE TRIGGER on_memory_updated
-  BEFORE UPDATE ON public.user_memories
-  FOR EACH ROW EXECUTE PROCEDURE public.handle_updated_at();
+CREATE TRIGGER on_memory_updated BEFORE UPDATE ON public.user_memories FOR EACH ROW EXECUTE PROCEDURE public.handle_updated_at();
