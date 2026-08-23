@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { useEffect, useState, Suspense, lazy } from 'react';
+import { useEffect, useRef, useState, Suspense, lazy } from 'react';
 import { Menu, Plus, AlertCircle, X, WifiOff, Loader2, RefreshCw, ArrowRightLeft } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useChatStore } from '@/lib/chat/store';
@@ -22,63 +22,223 @@ export const Route = createFileRoute('/')({
   component: () => <AuthGuard><ErrorBoundary><Suspense fallback={<div className="flex h-[100dvh] w-full items-center justify-center bg-[#0a0a0f]"><Loader2 className="w-8 h-8 text-primary animate-spin" /></div>}><RamaibotApp /></Suspense></ErrorBoundary></AuthGuard>,
 });
 
+function parseSseEvent(event: string, onJson: (value: any) => void) {
+  const dataLines = event
+    .replace(/\r/g, '')
+    .split('\n')
+    .filter(line => line.startsWith('data:'))
+    .map(line => line.slice(5).trimStart());
+  if (!dataLines.length) return;
+  const data = dataLines.join('\n').trim();
+  if (!data || data === '[DONE]') return;
+  try {
+    onJson(JSON.parse(data));
+  } catch {
+    // Ignore a single malformed event; the final response is validated below.
+  }
+}
+
+function drainSseBuffer(buffer: string, onEvent: (event: string) => void) {
+  const normalized = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const parts = normalized.split('\n\n');
+  const remainder = parts.pop() || '';
+  for (const part of parts) if (part.trim()) onEvent(part);
+  return remainder;
+}
+
 function RamaibotApp() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [modelStatuses, setModelStatuses] = useState<Record<string, 'Online' | 'Offline' | 'Checking' | 'Error'>>({});
-  const { theme, accentColor, autoPlayResponses, webSearchEnabled, memoryEnabled } = useSettingsStore();
+  const generationKeys = useRef(new Map<string, string>());
+  const { theme, accentColor, autoPlayResponses, webSearchEnabled, memoryEnabled, safeSearch } = useSettingsStore();
   const { speak } = useSpeechSynthesis();
   const { activeConversationId, createConversation, sendMessage, addAssistantMessage, updateAssistantMessage, finalizeAssistantMessage, isLoading, setLoading, error, setError, regenerateLastMessage, removeMessage, initialize, selectedModelId, abortController, setAbortController, isOffline, setOffline, setSelectedModelId } = useChatStore();
 
   useEffect(() => {
     initialize();
-    const handleOnline = () => setOffline(false); const handleOffline = () => setOffline(true);
-    window.addEventListener('online', handleOnline); window.addEventListener('offline', handleOffline);
-    return () => { window.removeEventListener('online', handleOnline); window.removeEventListener('offline', handleOffline); };
+    const handleOnline = () => setOffline(false);
+    const handleOffline = () => setOffline(true);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
   }, [initialize, setOffline]);
-  useEffect(() => { const root = window.document.documentElement; root.classList.remove('light', 'dark'); if (theme === 'system') root.classList.add(window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); else root.classList.add(theme); root.setAttribute('data-accent', accentColor); }, [theme, accentColor]);
+
+  useEffect(() => {
+    const root = window.document.documentElement;
+    root.classList.remove('light', 'dark');
+    if (theme === 'system') root.classList.add(window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    else root.classList.add(theme);
+    root.setAttribute('data-accent', accentColor);
+  }, [theme, accentColor]);
+
   useEffect(() => {
     let cancelled = false;
-    void (async () => { const { data: { session } } = await supabase.auth.getSession(); if (!session) return; try { const response = await fetch('/api/models', { cache: 'no-store', headers: { Authorization: `Bearer ${session.access_token}` } }); if (!response.ok) throw new Error(); const data = await response.json(); if (!cancelled) setModelStatuses(Object.fromEntries((data.models || []).map((m: any) => [m.id, m.status]))); } catch { if (!cancelled) setModelStatuses({}); } })();
+    setModelStatuses(Object.fromEntries(chatModels.map(model => [model.id, 'Checking'])) as Record<string, 'Checking'>);
+    void (async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) return;
+      try {
+        const response = await fetch('/api/models', { cache: 'no-store', headers: { Authorization: `Bearer ${session.access_token}` } });
+        if (!response.ok) throw new Error();
+        const data = await response.json();
+        if (!cancelled) setModelStatuses(Object.fromEntries((data.models || []).map((model: any) => [model.id, model.status])));
+      } catch {
+        if (!cancelled) setModelStatuses(Object.fromEntries(chatModels.map(model => [model.id, 'Error'])) as Record<string, 'Error'>);
+      }
+    })();
     return () => { cancelled = true; };
   }, [selectedModelId]);
 
-  const generateForConversation = async (conversationId: string, modelId: string) => {
-    setLoading(true); setError(null); const controller = new AbortController(); setAbortController(controller);
-    let tempMessageId = ''; let fullContent = ''; let responseMeta: MessageMetadata = { model: modelId, status: 'streaming' };
+  const generateForConversation = async (conversationId: string, modelId: string, requestId?: string) => {
+    setLoading(true);
+    setError(null);
+    const controller = new AbortController();
+    setAbortController(controller);
+    const generationId = requestId || generationKeys.current.get(conversationId) || crypto.randomUUID();
+    generationKeys.current.set(conversationId, generationId);
+    let tempMessageId = '';
+    let fullContent = '';
+    let responseMeta: MessageMetadata = { model: modelId, status: 'streaming' };
+
     try {
-      const { data: { session } } = await supabase.auth.getSession(); if (!session) throw new Error('AUTH');
-      const current = useChatStore.getState().conversations.find(c => c.id === conversationId);
-      const messages = (current?.messages || []).slice(-20).map(m => ({ role: m.role, content: m.content, attachments: m.attachments }));
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new Error('AUTH');
+      const current = useChatStore.getState().conversations.find(conversation => conversation.id === conversationId);
+      const messages = (current?.messages || []).slice(-20).map(message => ({ role: message.role, content: message.content, attachments: message.attachments }));
       tempMessageId = await addAssistantMessage('', modelId);
-      const response = await fetch('/api/chat/stream', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ conversationId, modelId, messages, webSearchEnabled, memoryEnabled }), signal: controller.signal });
-      if (!response.ok) { const payload = await response.json().catch(() => null); const error = new Error(payload?.error || 'Ramaibot couldn\'t generate a response.'); (error as any).status = response.status; throw error; }
-      const reader = response.body?.getReader(); if (!reader) throw new Error('Ramaibot couldn\'t generate a response.');
-      const decoder = new TextDecoder(); let buffer = '';
-      const processEvent = (event: string) => { const line = event.split('\n').find(l => l.startsWith('data: ')); if (!line) return; const data = line.slice(6).trim(); if (data === '[DONE]') return; try { const json = JSON.parse(data); if (json.meta) responseMeta = { ...responseMeta, ...json.meta, status: 'completed' }; const delta = json.choices?.[0]?.delta?.content; if (typeof delta === 'string' && delta) { fullContent += delta; updateAssistantMessage(tempMessageId, fullContent); } } catch { /* malformed SSE is ignored safely */ } };
-      while (true) { const { done, value } = await reader.read(); if (done) break; buffer += decoder.decode(value, { stream: true }); const events = buffer.split(/\n\n/); buffer = events.pop() || ''; for (const event of events) processEvent(event); }
-      buffer += decoder.decode(); if (buffer.trim()) processEvent(buffer); if (!fullContent.trim()) throw new Error('Ramaibot couldn\'t generate a response.');
-      responseMeta.status = 'completed'; responseMeta.model = responseMeta.model || modelId; await finalizeAssistantMessage(tempMessageId, fullContent, responseMeta); if (autoPlayResponses) speak(fullContent); return true;
-    } catch (err: any) { if (tempMessageId) await removeMessage(tempMessageId); if (err?.name !== 'AbortError') setError('Ramaibot couldn\'t generate a response.'); return false; }
-    finally { setLoading(false); setAbortController(null); }
+      const response = await fetch('/api/chat/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ conversationId, requestId: generationId, modelId, messages, webSearchEnabled, memoryEnabled, safeSearch }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        const generationError = new Error(payload?.error || "Ramaibot couldn't generate a response.");
+        (generationError as any).status = response.status;
+        throw generationError;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("Ramaibot couldn't generate a response.");
+      const decoder = new TextDecoder();
+      let buffer = '';
+      const processEvent = (event: string) => parseSseEvent(event, (json: any) => {
+        if (json.meta) responseMeta = { ...responseMeta, ...json.meta, status: 'completed' };
+        const delta = json.choices?.[0]?.delta?.content;
+        if (typeof delta === 'string' && delta) {
+          fullContent += delta;
+          updateAssistantMessage(tempMessageId, fullContent);
+        }
+      });
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        buffer = drainSseBuffer(buffer, processEvent);
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) processEvent(buffer);
+      if (!fullContent.trim()) throw new Error("Ramaibot couldn't generate a response.");
+
+      responseMeta.status = 'completed';
+      responseMeta.model = responseMeta.model || modelId;
+      await finalizeAssistantMessage(tempMessageId, fullContent, responseMeta);
+      generationKeys.current.delete(conversationId);
+      if (autoPlayResponses) speak(fullContent);
+      return true;
+    } catch (err: any) {
+      if (tempMessageId) await removeMessage(tempMessageId);
+      if (err?.name !== 'AbortError') setError("Ramaibot couldn't generate a response.");
+      return false;
+    } finally {
+      setLoading(false);
+      setAbortController(null);
+    }
   };
 
-  const handleSendMessage = async (text: string, attachments: Attachment[] = []) => { if ((!text.trim() && attachments.length === 0) || isLoading) return; if (isOffline) { setError('Ramaibot couldn\'t generate a response.'); return; } setError(null); await sendMessage(text, attachments); const conversationId = useChatStore.getState().activeConversationId; if (!conversationId) { setError('Ramaibot couldn\'t generate a response.'); return; } await generateForConversation(conversationId, selectedModelId); };
-  const retry = async () => { const conversationId = useChatStore.getState().activeConversationId; if (conversationId) await generateForConversation(conversationId, selectedModelId); };
-  const switchModel = async () => { const ordered = chatModels.map(m => m.id); const start = ordered.indexOf(selectedModelId); const candidates = ordered.slice(start + 1).concat(ordered.slice(0, start + 1)); const next = candidates.find(id => modelStatuses[id] === 'Online') || candidates[0]; if (!next) return; setSelectedModelId(next); const conversationId = useChatStore.getState().activeConversationId; if (conversationId) await generateForConversation(conversationId, next); };
+  const handleSendMessage = async (text: string, attachments: Attachment[] = []) => {
+    if ((!text.trim() && attachments.length === 0) || isLoading) return;
+    if (isOffline) {
+      setError("Ramaibot couldn't generate a response.");
+      return;
+    }
+    setError(null);
+    const conversationBeforeSend = useChatStore.getState().activeConversationId;
+    await sendMessage(text, attachments);
+    const conversationId = useChatStore.getState().activeConversationId;
+    if (!conversationId) {
+      setError("Ramaibot couldn't generate a response.");
+      return;
+    }
+    const requestId = crypto.randomUUID();
+    generationKeys.current.set(conversationId, requestId);
+    if (conversationBeforeSend !== conversationId) generationKeys.current.delete(conversationBeforeSend || '');
+    await generateForConversation(conversationId, selectedModelId, requestId);
+  };
+
+  const retry = async () => {
+    const conversationId = useChatStore.getState().activeConversationId;
+    if (!conversationId) return;
+    const current = useChatStore.getState().conversations.find(conversation => conversation.id === conversationId);
+    const last = current?.messages[current.messages.length - 1];
+    if (last?.role === 'assistant') await removeMessage(last.id);
+    await generateForConversation(conversationId, selectedModelId, generationKeys.current.get(conversationId));
+  };
+
+  const switchModel = () => {
+    const ordered = chatModels.map(model => model.id);
+    const start = ordered.indexOf(selectedModelId);
+    const candidates = ordered.slice(start + 1).concat(ordered.slice(0, start + 1));
+    const next = candidates.find(id => modelStatuses[id] === 'Online') || candidates.find(id => modelStatuses[id] !== 'Offline');
+    if (next) setSelectedModelId(next);
+  };
+
+  const regenerate = async () => {
+    if (!activeConversationId || isLoading) return;
+    await regenerateLastMessage();
+    const updated = useChatStore.getState().conversations.find(conversation => conversation.id === activeConversationId);
+    const user = updated?.messages[updated.messages.length - 1];
+    if (user?.role !== 'user') return;
+    const requestId = crypto.randomUUID();
+    generationKeys.current.set(activeConversationId, requestId);
+    await generateForConversation(activeConversationId, selectedModelId, requestId);
+  };
+
+  const editMessage = async (id: string, content: string) => {
+    if (!activeConversationId || isLoading) return;
+    const current = useChatStore.getState().conversations.find(conversation => conversation.id === activeConversationId);
+    if (!current) return;
+    const index = current.messages.findIndex(message => message.id === id);
+    if (index === -1) return;
+    for (const message of current.messages.slice(index)) await removeMessage(message.id);
+    await sendMessage(content);
+    const conversationId = useChatStore.getState().activeConversationId;
+    if (conversationId) {
+      const requestId = crypto.randomUUID();
+      generationKeys.current.set(conversationId, requestId);
+      await generateForConversation(conversationId, selectedModelId, requestId);
+    }
+  };
 
   return (
     <div className="flex h-[100dvh] w-full overflow-hidden bg-[#0a0a0f] selection:bg-primary/30 selection:text-white relative pb-safe">
-      <Suspense fallback={null}><SplashScreen /></Suspense><Suspense fallback={null}><OnboardingOverlay /></Suspense>
+      <Suspense fallback={null}><SplashScreen /></Suspense>
+      <Suspense fallback={null}><OnboardingOverlay /></Suspense>
       <div className="fixed inset-0 overflow-hidden pointer-events-none z-0"><div className="absolute top-[-20%] left-[-10%] w-[70%] h-[70%] bg-primary/10 blur-[140px] animate-mesh rounded-full mix-blend-screen" /><div className="absolute bottom-[-20%] right-[-10%] w-[70%] h-[70%] bg-accent/10 blur-[140px] animate-mesh delay-1000 rounded-full mix-blend-screen" /><div className="absolute top-[30%] right-[10%] w-[40%] h-[40%] bg-violet-500/5 blur-[120px] animate-mesh delay-500 rounded-full" /></div>
       <aside className={`${sidebarOpen ? 'w-[280px]' : 'w-0'} hidden lg:flex flex-col z-30 overflow-hidden transition-all duration-500 ease-[cubic-bezier(0.2,0.8,0.2,1)] relative border-r border-white/5 bg-background/20 backdrop-blur-2xl`}><ConversationSidebar onClose={() => setSidebarOpen(false)} onOpenSettings={() => setIsSettingsOpen(true)} /></aside>
       <AnimatePresence>{mobileMenuOpen && <div className="fixed inset-0 z-50 lg:hidden"><motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 bg-black/60 backdrop-blur-md" onClick={() => setMobileMenuOpen(false)} /><motion.aside initial={{ x: '-100%' }} animate={{ x: 0 }} exit={{ x: '-100%' }} transition={{ type: 'spring', damping: 25, stiffness: 200 }} className="absolute top-0 left-0 h-full w-[90vw] glass-strong border-r border-white/5 shadow-2xl z-50 overflow-hidden"><ConversationSidebar onClose={() => setMobileMenuOpen(false)} onOpenSettings={() => setIsSettingsOpen(true)} isMobile /></motion.aside></div>}</AnimatePresence>
       <main className="flex-1 flex flex-col h-full relative z-10 overflow-hidden">
-        <header className="h-14 flex items-center justify-between px-3 sm:px-4 z-20 sticky top-0 bg-background/30 backdrop-blur-xl border-b border-white/5 flex-shrink-0"><div className="flex items-center gap-2"><button onClick={() => setMobileMenuOpen(true)} className="p-2 -ml-1 rounded-xl hover:bg-white/5 transition-colors lg:hidden" aria-label="Open menu"><Menu className="w-5 h-5 text-muted-foreground" /></button>{!sidebarOpen && <button onClick={() => setSidebarOpen(true)} className="hidden lg:flex p-2 -ml-2 rounded-xl hover:bg-white/5 transition-colors" aria-label="Open sidebar"><Menu className="w-5 h-5 text-muted-foreground" /></button>}<div className="flex flex-col" onClick={() => setIsSettingsOpen(true)} style={{ cursor: 'pointer' }}><div className="flex items-center gap-1.5"><span className="font-bold text-sm tracking-tight text-foreground">Ramaibot</span><div className="w-1 h-1 rounded-full bg-emerald-500 ml-0.5" /></div><span className="text-[8px] uppercase tracking-[0.2em] font-bold text-muted-foreground/40 leading-none">Intelligence</span></div></div><div className="flex items-center gap-1.5 sm:gap-2"><div className="flex items-center glass px-2 py-1 rounded-lg border-white/5 bg-white/5 h-8" title={modelStatuses[selectedModelId] || 'Checking'}><span className={`w-1.5 h-1.5 rounded-full mr-1.5 ${modelStatuses[selectedModelId] === 'Online' ? 'bg-emerald-400' : modelStatuses[selectedModelId] === 'Error' ? 'bg-red-400' : modelStatuses[selectedModelId] === 'Offline' ? 'bg-zinc-500' : 'bg-amber-400 animate-pulse'}`} /><select value={selectedModelId} onChange={e => setSelectedModelId(e.target.value)} className="bg-transparent text-[10px] font-bold uppercase tracking-wider text-muted-foreground border-none focus:ring-0 cursor-pointer py-0 pr-6" aria-label="Select AI model">{chatModels.map(m => <option key={m.id} value={m.id} className="bg-zinc-900">{m.name}</option>)}</select></div><button onClick={() => createConversation()} className="p-2 rounded-xl hover:bg-white/5 transition-colors" title="New Chat" aria-label="New Chat"><Plus className="w-5 h-5 text-muted-foreground" /></button></div></header>
+        <header className="h-14 flex items-center justify-between px-3 sm:px-4 z-20 sticky top-0 bg-background/30 backdrop-blur-xl border-b border-white/5 flex-shrink-0"><div className="flex items-center gap-2"><button onClick={() => setMobileMenuOpen(true)} className="p-2 -ml-1 rounded-xl hover:bg-white/5 transition-colors lg:hidden" aria-label="Open menu"><Menu className="w-5 h-5 text-muted-foreground" /></button>{!sidebarOpen && <button onClick={() => setSidebarOpen(true)} className="hidden lg:flex p-2 -ml-2 rounded-xl hover:bg-white/5 transition-colors" aria-label="Open sidebar"><Menu className="w-5 h-5 text-muted-foreground" /></button>}<div className="flex flex-col" onClick={() => setIsSettingsOpen(true)} style={{ cursor: 'pointer' }}><div className="flex items-center gap-1.5"><span className="font-bold text-sm tracking-tight text-foreground">Ramaibot</span><div className="w-1 h-1 rounded-full bg-emerald-500 ml-0.5" /></div><span className="text-[8px] uppercase tracking-[0.2em] font-bold text-muted-foreground/40 leading-none">Intelligence</span></div></div><div className="flex items-center gap-1.5 sm:gap-2"><div className="flex items-center glass px-2 py-1 rounded-lg border-white/5 bg-white/5 h-8" title={modelStatuses[selectedModelId] || 'Checking'}><span className={`w-1.5 h-1.5 rounded-full mr-1.5 ${modelStatuses[selectedModelId] === 'Online' ? 'bg-emerald-400' : modelStatuses[selectedModelId] === 'Error' ? 'bg-red-400' : modelStatuses[selectedModelId] === 'Offline' ? 'bg-zinc-500' : 'bg-amber-400 animate-pulse'}`} /><select value={selectedModelId} onChange={e => setSelectedModelId(e.target.value)} className="bg-transparent text-[10px] font-bold uppercase tracking-wider text-muted-foreground border-none focus:ring-0 cursor-pointer py-0 pr-6" aria-label="Select AI model">{chatModels.map(model => <option key={model.id} value={model.id} className="bg-zinc-900">{model.name} · {modelStatuses[model.id] || 'Checking'}</option>)}</select></div><button onClick={() => createConversation()} className="p-2 rounded-xl hover:bg-white/5 transition-colors" title="New Chat" aria-label="New Chat"><Plus className="w-5 h-5 text-muted-foreground" /></button></div></header>
         {isOffline && <div className="mx-6 mt-4 p-4 glass-strong border-amber-500/20 bg-amber-500/5 rounded-2xl flex items-center gap-3 text-amber-400 text-sm"><WifiOff className="w-5 h-5 flex-shrink-0" /><div className="flex-1">Working in offline mode. Previous conversations are read-only.</div></div>}
         {error && <div className="mx-6 mt-4 p-4 glass-strong border-red-500/20 bg-red-500/5 rounded-2xl flex items-center gap-3 text-red-400 text-sm" role="alert"><AlertCircle className="w-5 h-5 flex-shrink-0" /><div className="flex-1">Ramaibot couldn&apos;t generate a response.</div><button onClick={retry} className="px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 flex items-center gap-1.5 text-xs" aria-label="Retry response"><RefreshCw className="w-3.5 h-3.5" />Retry</button><button onClick={switchModel} className="px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 flex items-center gap-1.5 text-xs" aria-label="Switch model"><ArrowRightLeft className="w-3.5 h-3.5" />Switch Model</button><button onClick={() => setError(null)} className="p-1 hover:bg-white/5 rounded-lg" aria-label="Dismiss error"><X className="w-4 h-4" /></button></div>}
-        <div className="flex-1 overflow-hidden relative"><MessageList onSendMessage={handleSendMessage} onRegenerate={async () => { const current = useChatStore.getState().conversations.find(c => c.id === activeConversationId); if (!current?.messages.length) return; const last = current.messages[current.messages.length - 1]; if (last.role === 'assistant') { await regenerateLastMessage(); const updated = useChatStore.getState().conversations.find(c => c.id === activeConversationId); const user = updated?.messages[updated.messages.length - 1]; if (user?.role === 'user') await generateForConversation(activeConversationId!, selectedModelId); } }} onEditMessage={async (id, content) => { const current = useChatStore.getState().conversations.find(c => c.id === activeConversationId); if (!current) return; const index = current.messages.findIndex(m => m.id === id); if (index === -1) return; for (const m of current.messages.slice(index)) await removeMessage(m.id); await sendMessage(content); const conversationId = useChatStore.getState().activeConversationId; if (conversationId) await generateForConversation(conversationId, selectedModelId); }} /></div>
+        <div className="flex-1 overflow-hidden relative"><MessageList onSendMessage={handleSendMessage} onRegenerate={regenerate} onEditMessage={editMessage} /></div>
         <ChatComposer onSend={handleSendMessage} />
         <AnimatePresence>{isSettingsOpen && <Suspense fallback={null}><motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[100]"><SettingsView onClose={() => setIsSettingsOpen(false)} /></motion.div></Suspense>}</AnimatePresence>
       </main>
