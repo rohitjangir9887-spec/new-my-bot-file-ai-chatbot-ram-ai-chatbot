@@ -1,12 +1,9 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { useEffect } from 'react';
+import { SettingsView } from '@/components/settings/SettingsView';
 
-export const Route = createFileRoute('/settings')({ component: SettingsRedirect });
+export const Route = createFileRoute('/settings')({ component: SettingsRoute });
 
-function SettingsRedirect() {
+function SettingsRoute() {
   const navigate = useNavigate();
-  useEffect(() => {
-    void navigate({ to: '/', hash: 'settings', replace: true });
-  }, [navigate]);
-  return <div className="flex h-[100dvh] items-center justify-center bg-[#0a0a0f] text-muted-foreground">Opening Settings…</div>;
+  return <SettingsView onClose={() => void navigate({ to: '/' })} />;
 }
